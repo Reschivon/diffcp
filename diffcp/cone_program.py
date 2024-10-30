@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import sys
 import warnings
 from multiprocessing.pool import ThreadPool
 
@@ -24,10 +25,23 @@ def pi(z, cones):
 
 
 def solve_and_derivative_wrapper(A, b, c, cone_dict, warm_start, mode, kwargs):
-    """A wrapper around solve_and_derivative for the batch function."""
-    return solve_and_derivative(
-        A, b, c, cone_dict, warm_start=warm_start, mode=mode, **kwargs)
+    """A wrapper around solve_and_derivative for the batch function, with exception handling."""
+    try:
+        results = solve_and_derivative(A, b, c, cone_dict, warm_start=warm_start, mode=mode, **kwargs)
+        return results
+    except KeyboardInterrupt as e:
+        raise KeyboardInterrupt()
+    except SolverError as e:
+        print('error', str(e))
+        
+        if str(e) == 'Solver scs returned status interrupted':
+            raise SolverError('Someone hit ctrl + c')
+            
+        # Return default values in case of exception
+        # (151,) (303,) (303,)
+        return None, None, None, None, None
 
+cached_solutions = None
 
 def solve_and_derivative_batch(As, bs, cs, cone_dicts, n_jobs_forward=-1, n_jobs_backward=-1,
                                mode="lsqr", warm_starts=None, **kwargs):
@@ -65,7 +79,11 @@ def solve_and_derivative_batch(As, bs, cs, cone_dicts, n_jobs_forward=-1, n_jobs
     """
     batch_size = len(As)
     if warm_starts is None:
-        warm_starts = [None] * batch_size
+        global cached_solutions
+        if cached_solutions is not None:
+            warm_starts = cached_solutions
+        else:
+            warm_starts = [None] * batch_size
     if n_jobs_forward == -1:
         n_jobs_forward = mp.cpu_count()
     if n_jobs_backward == -1:
@@ -97,6 +115,9 @@ def solve_and_derivative_batch(As, bs, cs, cone_dicts, n_jobs_forward=-1, n_jobs
         ss = [r[2] for r in results]
         Ds = [r[3] for r in results]
         DTs = [r[4] for r in results]
+        
+    # Save warm starts for the backward pass
+    warm_starts = [(x.copy(), y.copy(), s.copy()) if x is not None else None for x, y, s in zip(xs, ys, ss)]
 
     if n_jobs_backward == 1:
         def D_batch(dAs, dbs, dcs, **kwargs):
@@ -134,7 +155,14 @@ def solve_and_derivative_batch(As, bs, cs, cone_dicts, n_jobs_forward=-1, n_jobs
             pool = ThreadPool(processes=n_jobs_backward)
 
             def DTi(i):
-                return DTs[i](dxs[i], dys[i], dss[i], **kwargs)
+                if DTs[i] is None:
+                    # FIXME return zeros derivative when error
+                    return np.zeros((303, 151)), np.zeros((303,)), np.zeros((151,))
+                    
+                result = DTs[i](dxs[i], dys[i], dss[i], **kwargs)
+                # print('result shape', len(result), result[0].shape, result[1].shape, result[2].shape)
+                return result
+                
             results = pool.map(DTi, range(batch_size))
             pool.close()
             dAs = [r[0] for r in results]
@@ -252,7 +280,10 @@ def solve_and_derivative_internal(A, b, c, cone_dict, solve_method=None,
             solve_method = "SCS"
         else:
             solve_method = "ECOS"
-
+    
+    # print('Override solver to ECOS')
+    # solve_method = 'ECOS'
+    
     if solve_method == "SCS":
 
         # SCS versions SCS 2.*
@@ -287,6 +318,7 @@ def solve_and_derivative_internal(A, b, c, cone_dict, solve_method=None,
         inaccurate_status = {"Solved/Inaccurate", "solved (inaccurate - reached max_iters)"}
         if status in inaccurate_status and "acceleration_lookback" not in kwargs:
             # anderson acceleration is sometimes unstable
+            print("Solved/Inaccurate. Retrying without acceleration_lookback.")
             result = scs.solve(
                 data, cone_dict, acceleration_lookback=0, **kwargs)
             status = result["info"]["status"]
@@ -366,7 +398,8 @@ def solve_and_derivative_internal(A, b, c, cone_dict, solve_method=None,
         status = solution["info"]["exitFlag"]
         STATUS_LOOKUP = {0: "Optimal", 1: "Infeasible", 2: "Unbounded", 10: "Optimal Inaccurate",
                          11: "Infeasible Inaccurate", 12: "Unbounded Inaccurate"}
-
+       
+        print('Status:', solution["info"])
         if status == 10:
             warnings.warn("Solved/Inaccurate.")
         elif status < 0:
